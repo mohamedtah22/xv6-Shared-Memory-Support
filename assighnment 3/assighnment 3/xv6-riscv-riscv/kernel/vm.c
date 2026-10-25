@@ -180,14 +180,12 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
     panic("uvmunmap: not aligned");
 
   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
-    if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
-    if((*pte & PTE_V) == 0)
-      panic("uvmunmap: not mapped");
+    if((pte = walk(pagetable, a, 0)) == 0 || (*pte & PTE_V) == 0)
+      continue; // Explicit shared unmap can leave holes in an address space.
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
-    // Only free physical page if it's not shared and do_free is requested
-    if(do_free && (*pte & PTE_S) == 0){
+    // Every mapping owns a reference, including a shared alias.
+    if(do_free){
       uint64 pa = PTE2PA(*pte);
       kfree((void*)pa);
     }
@@ -315,12 +313,10 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
-      panic("uvmcopy: pte should exist");
-    if((*pte & PTE_V) == 0)
-      panic("uvmcopy: page not present");
+    if((pte = walk(old, i, 0)) == 0 || (*pte & PTE_V) == 0)
+      continue;
     pa = PTE2PA(*pte);
-    flags = PTE_FLAGS(*pte);
+    flags = PTE_FLAGS(*pte) & ~PTE_S; // fork makes a private copy
     if((mem = kalloc()) == 0)
       goto err;
     memmove(mem, (char*)pa, PGSIZE);
@@ -443,107 +439,54 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 }
 
 
-uint64 
-map_shared_pages(struct proc* src_proc, struct proc* dst_proc, uint64 src_va, uint64 size)
+// Caller holds vmspace_lock and the source process lock.
+uint64
+map_shared_pages(struct proc *src, struct proc *dst, uint64 addr, uint64 size)
 {
-  uint64 src_start, dst_start;
-  uint64 src_end, dst_end;
-  uint64 pa, flags;
-  pte_t *src_pte;
-  uint64 offset;
-  
-  if(size == 0)
+  if(src == dst || size == 0 || addr >= MAXVA || size > MAXVA - addr ||
+     addr + size > src->sz || addr + size > dst->sz)
     return -1;
-  
-  // Calculate page-aligned boundaries
-  src_start = PGROUNDDOWN(src_va);
-  src_end   = PGROUNDUP(src_va + size);
-  offset    = src_va - src_start;  // Offset within the first page
-  
-  // ** Map at the same VA as the source, not at dst_proc->sz **
-  dst_start = src_start;
-  dst_end   = dst_start + (src_end - src_start);
-  
-  // Check if we have enough space
-  if(dst_end >= MAXVA)
-    return -1;
-  
-  // ** Unmap any existing child pages at dst_start so mappages can overwrite **
-  uvmunmap(dst_proc->pagetable,
-           dst_start,
-           (src_end - src_start) / PGSIZE,
-           /*do_free=*/1);
-  
-  // Map each page from source to destination
-  for(uint64 src_addr = src_start, dst_addr = dst_start; 
-      src_addr < src_end; 
-      src_addr += PGSIZE, dst_addr += PGSIZE) {
-    
-    // Get the source PTE
-    if((src_pte = walk(src_proc->pagetable, src_addr, 0)) == 0)
-      goto bad;
-    
-    // Check if source page is valid and user-accessible
-    if((*src_pte & PTE_V) == 0 || (*src_pte & PTE_U) == 0)
-      goto bad;
-    
-    // Get physical address and flags from source
-    pa    = PTE2PA(*src_pte);
-    flags = PTE_FLAGS(*src_pte);
-    
-    // Add shared flag
-    flags |= PTE_S;
-    
-    // Map the physical page to destination process
-    if(mappages(dst_proc->pagetable, dst_addr, PGSIZE, pa, flags) != 0)
-      goto bad;
+  uint64 start = PGROUNDDOWN(addr);
+  uint64 end = PGROUNDUP(addr + size);
+  // Validate the complete range before replacing any destination page.
+  // Existing page-table paths make the commit allocation-free/infallible.
+  for(uint64 va = start; va < end; va += PGSIZE){
+    pte_t *sp = walk(src->pagetable, va, 0);
+    pte_t *dp = walk(dst->pagetable, va, 0);
+    if(sp == 0 || dp == 0 || (*sp & (PTE_V|PTE_U)) != (PTE_V|PTE_U) ||
+       (*sp & (PTE_R|PTE_W|PTE_X)) == 0)
+      return -1;
+    if((*dp & PTE_V) &&
+       (((*dp & PTE_U) == 0) || (*dp & (PTE_R|PTE_W|PTE_X)) == 0))
+      return -1;
   }
-  
-  // Return the virtual address in destination process with correct offset
-  return dst_start + offset;
-
-bad:
-  // Cleanup on failure: unmap what we partially mapped (no free)
-  uvmunmap(dst_proc->pagetable,
-           dst_start,
-           (dst_end - dst_start) / PGSIZE,
-           /*do_free=*/0);
-  return -1;
+  for(uint64 va = start; va < end; va += PGSIZE){
+    pte_t *sp = walk(src->pagetable, va, 0);
+    pte_t *dp = walk(dst->pagetable, va, 0);
+    uint64 pa = PTE2PA(*sp);
+    krefinc(pa); // Retain before releasing a possibly identical old alias.
+    if(*dp & PTE_V)
+      kfree((void *)PTE2PA(*dp));
+    *dp = PA2PTE(pa) | PTE_FLAGS(*sp) | PTE_S | PTE_V;
+  }
+  sfence_vma();
+  return addr;
 }
 
-
-// Unmap shared pages from process
-uint64 
-unmap_shared_pages(struct proc* p, uint64 addr, uint64 size)
+uint64
+unmap_shared_pages(struct proc *p, uint64 addr, uint64 size)
 {
-  uint64 start, end;
-  pte_t *pte;
-  
-  if(size == 0)
+  if(size == 0 || addr >= MAXVA || size > MAXVA - addr || addr + size > p->sz)
     return -1;
-  
-  // Calculate page-aligned boundaries
-  start = PGROUNDDOWN(addr);
-  end = PGROUNDUP(addr + size);
-  
-  // Verify that all pages in the range are shared
-  for(uint64 va = start; va < end; va += PGSIZE) {
-    if((pte = walk(p->pagetable, va, 0)) == 0)
+  uint64 start = PGROUNDDOWN(addr);
+  uint64 end = PGROUNDUP(addr + size);
+  for(uint64 va = start; va < end; va += PGSIZE){
+    pte_t *pte = walk(p->pagetable, va, 0);
+    if(pte == 0 || (*pte & (PTE_V|PTE_S)) != (PTE_V|PTE_S))
       return -1;
-    
-    if((*pte & PTE_V) == 0 || (*pte & PTE_S) == 0)
-      return -1;  // Not a valid shared page
   }
-  
-  // Unmap the pages (don't free physical pages - they're shared)
-  uvmunmap(p->pagetable, start, (end - start) / PGSIZE, 0);
-  
-  // Update process size if unmapping from the end
-  if(end == p->sz) {
-    p->sz = start;
-  }
-  
+  uvmunmap(p->pagetable, start, (end - start) / PGSIZE, 1);
+  sfence_vma();
+  // sz remains the upper bound; fork/exit now tolerate unmapped holes.
   return 0;
 }
-
-            

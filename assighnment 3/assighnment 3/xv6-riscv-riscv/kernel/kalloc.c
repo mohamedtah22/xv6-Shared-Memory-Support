@@ -21,6 +21,7 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
+  uint refs[(PHYSTOP - KERNBASE) / PGSIZE];
 } kmem;
 
 void
@@ -35,8 +36,10 @@ freerange(void *pa_start, void *pa_end)
 {
   char *p;
   p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
+    kmem.refs[((uint64)p - KERNBASE) / PGSIZE] = 1;
     kfree(p);
+  }
 }
 
 // Free the page of physical memory pointed at by pa,
@@ -51,12 +54,17 @@ kfree(void *pa)
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
-
-  r = (struct run*)pa;
-
   acquire(&kmem.lock);
+  uint index = ((uint64)pa - KERNBASE) / PGSIZE;
+  if(kmem.refs[index] == 0)
+    panic("kfree: unowned page");
+  if(--kmem.refs[index] != 0){
+    release(&kmem.lock);
+    return;
+  }
+  // Poison only after the last owner releases the frame.
+  memset(pa, 1, PGSIZE);
+  r = (struct run*)pa;
   r->next = kmem.freelist;
   kmem.freelist = r;
   release(&kmem.lock);
@@ -72,11 +80,28 @@ kalloc(void)
 
   acquire(&kmem.lock);
   r = kmem.freelist;
-  if(r)
+  if(r){
     kmem.freelist = r->next;
+    kmem.refs[((uint64)r - KERNBASE) / PGSIZE] = 1;
+  }
   release(&kmem.lock);
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
+}
+
+
+// Caller must already own a live reference (protected by vmspace_lock).
+void
+krefinc(uint64 pa)
+{
+  if(pa % PGSIZE || pa < (uint64)end || pa >= PHYSTOP)
+    panic("krefinc: invalid page");
+  acquire(&kmem.lock);
+  uint index = (pa - KERNBASE) / PGSIZE;
+  if(kmem.refs[index] == 0 || kmem.refs[index] == (uint)-1)
+    panic("krefinc: invalid reference");
+  kmem.refs[index]++;
+  release(&kmem.lock);
 }

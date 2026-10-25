@@ -14,6 +14,10 @@ struct proc *initproc;
 
 int nextpid = 1;
 struct spinlock pid_lock;
+// Serializes published user page tables, including exec/grow/fork/reaping.
+static struct spinlock vmspace_lock;
+void vmspace_acquire(void) { acquire(&vmspace_lock); }
+void vmspace_release(void) { release(&vmspace_lock); }
 
 extern void forkret(void);
 static void freeproc(struct proc *p);
@@ -50,6 +54,7 @@ procinit(void)
   struct proc *p;
   
   initlock(&pid_lock, "nextpid");
+  initlock(&vmspace_lock, "vmspace");
   initlock(&wait_lock, "wait_lock");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
@@ -155,6 +160,7 @@ found:
 static void
 freeproc(struct proc *p)
 {
+  vmspace_acquire();
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
@@ -162,6 +168,7 @@ freeproc(struct proc *p)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
   p->sz = 0;
+  vmspace_release();
   p->pid = 0;
   p->parent = 0;
   p->name[0] = 0;
@@ -262,15 +269,23 @@ growproc(int n)
   uint64 sz;
   struct proc *p = myproc();
 
+  vmspace_acquire();
   sz = p->sz;
+  if((n > 0 && (sz + n < sz || sz + n >= MAXVA)) ||
+     (n < 0 && (uint64)(-(long)n) > sz)){
+    vmspace_release();
+    return -1;
+  }
   if(n > 0){
     if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+      vmspace_release();
       return -1;
     }
   } else if(n < 0){
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
   p->sz = sz;
+  vmspace_release();
   return 0;
 }
 
@@ -289,12 +304,15 @@ fork(void)
   }
 
   // Copy user memory from parent to child.
+  vmspace_acquire();
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+    vmspace_release();
     freeproc(np);
     release(&np->lock);
     return -1;
   }
   np->sz = p->sz;
+  vmspace_release();
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -694,5 +712,6 @@ struct proc* find_proc_by_pid(int pid) {
   }
   return 0;
 }
+
 
 

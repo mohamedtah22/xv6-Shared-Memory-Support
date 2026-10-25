@@ -10,11 +10,14 @@
 int
 main(void) {
     const int num_children = 4;
-    char *shared_buf = malloc(PGSIZE);
+    char *raw = sbrk(2*PGSIZE);
+    char *shared_buf = raw == (char*)-1 ? 0 : (char*)(((uint64)raw+PGSIZE-1)&~(uint64)(PGSIZE-1));
     if (shared_buf == 0) {
         printf("malloc failed\n");
         exit(1);
     }
+    memset(shared_buf, 0, PGSIZE);
+    int parent_pid = getpid();
     printf("Parent: allocated shared buffer at %p\n", shared_buf);
 
     for (int i = 0; i < num_children; i++) {
@@ -23,13 +26,11 @@ main(void) {
             printf("fork failed\n");
             exit(1);
         }
-        if (pid > 0) {
-            // Parent: map the shared page into the child's address space
-            if (map_shared_pages(getpid(), pid, shared_buf, PGSIZE) < 0) {
-                printf("map_shared_pages failed for child %d\n", pid);
+        if (pid == 0) {
+            if(map_shared_pages(parent_pid, getpid(), shared_buf, PGSIZE) == (uint64)-1){
+                printf("child map_shared_pages failed\n");
                 exit(1);
             }
-        } else {
             // Child: write its log entry
             int idx = i + 1;
             sleep(idx);  // stagger output
@@ -69,6 +70,7 @@ main(void) {
     // small delay to ensure all writes are visible
     sleep(2);
 
+    int seen = 0;
     // Parent reads back the log entries
     printf("\nParent reading messages:\n");
     char *addr = shared_buf;
@@ -79,6 +81,13 @@ main(void) {
         int idx = hdr >> 16;
         int mlen = hdr & 0xFFFF;
         char buf[64];
+        if(idx < 1 || idx > num_children || mlen >= sizeof(buf) ||
+           (uint64)(addr + HEADER_SIZE + mlen) > (uint64)(shared_buf + PGSIZE) ||
+           (seen & (1 << idx))){
+            printf("LOG_TEST: FAIL (invalid record)\n");
+            exit(1);
+        }
+        seen |= 1 << idx;
         memmove(buf, addr + HEADER_SIZE, mlen);
         buf[mlen] = '\0';
         printf("Message from child %d: %s\n", idx, buf);
@@ -86,6 +95,8 @@ main(void) {
         addr = (char*)next;
     }
 
-    printf("\nParent done.\n");
+    if(seen != 0x1e){ printf("LOG_TEST: FAIL (missing records)\n"); exit(1); }
+    printf("LOG_TEST: PASS\n");
     exit(0);
 }
+

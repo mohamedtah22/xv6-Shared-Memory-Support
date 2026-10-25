@@ -1,168 +1,67 @@
-# xv6 Shared-Memory Support
+# xv6 shared-memory kernel extension
 
-A kernel-level extension to MIT xv6-riscv that allows processes to map the same physical user pages into their address spaces.
+A C/RISC-V extension of MIT xv6 with shared-page syscalls, reference-counted
+physical frames, and QEMU kernel regression tests. The original xv6 source is
+under `assighnment 3/assighnment 3/xv6-riscv-riscv/`; its existing MIT license
+remains there. The restored `mkfs/mkfs.c` is attributed to upstream MIT xv6.
 
-The implementation adds two system calls, a shared-page PTE flag, lifecycle-aware unmapping, and user-space programs that verify cross-process visibility and exercise a concurrent shared log.
+## Contract
 
-## Project Scope
+```c
+uint64 map_shared_pages(int source_pid, int destination_pid, void *address, uint64 size);
+int unmap_shared_pages(void *address, uint64 size);
+```
 
-This repository focuses on:
+Destination must be the calling process and must differ from source. The source
+must be a live process. Both address spaces must already reserve the requested
+range at the same virtual address. The result preserves the byte offset; failure
+returns `-1`. The whole covered page range is shared, so callers should use
+page-aligned dedicated allocations rather than allocator metadata.
 
-- mapping an existing user-memory range from one process into another;
-- preserving the source virtual address in the destination process;
-- ensuring shared pages are not freed by the destination during unmapping;
-- exposing the functionality through xv6 system calls;
-- validating the implementation with **shmem_test** and **log_test**.
+This is an educational API. Source-process lookup does not implement a
+production permission or shared-memory-handle system.
 
-## How the Mapping Works
+## Memory safety and concurrency
 
-~~~mermaid
-flowchart TD
-    A["Source process virtual page"] --> B["Physical page frame"]
-    C["Destination process same virtual address"] --> B
-    D["Destination PTE marked PTE_S"] --> C
-    E["Unmap removes PTE without freeing frame"] --> D
-~~~
-
-The destination receives page-table entries that reference the source process's existing physical frames. The mapping keeps the original page offset, rounds the covered range to page boundaries internally, and copies the original access flags while adding **PTE_S**.
-
-## User API
-
-The following declarations are exposed in **user/user.h**:
-
-~~~c
-int map_shared_pages(int src_pid, int dst_pid, void *src_va, uint64 size);
-int unmap_shared_pages(void *addr, uint64 size);
-~~~
-
-### map_shared_pages
-
-Maps the source process range **[src_va, src_va + size)** into the destination process at the same virtual address.
-
-- Returns the mapped virtual address on success.
-- Returns **-1** when the process or mapping request is invalid.
-- Replaces destination mappings in the target range before installing the shared mappings.
-- Rolls back pages installed during the current operation if a later page cannot be mapped.
-
-### unmap_shared_pages
-
-Removes a shared mapping from the calling process.
-
-- Verifies that every covered page is valid and marked shared.
-- Removes the page-table entries without freeing the underlying physical frames.
-- Returns **0** on success and **-1** for an invalid range.
-
-## Kernel Changes
-
-| File | Responsibility |
-|---|---|
-| **kernel/riscv.h** | Defines **PTE_S**, the software-managed shared-page flag |
-| **kernel/vm.c** | Implements page mapping/unmapping and shared-page-aware cleanup |
-| **kernel/sysproc.c** | Resolves source/destination processes and handles syscall arguments |
-| **kernel/syscall.c** | Connects syscall numbers to kernel handlers |
-| **kernel/syscall.h** | Assigns syscall numbers 23 and 24 |
-| **kernel/defs.h** | Publishes kernel function declarations |
-| **kernel/proc.c** | Includes process lookup support |
-| **user/user.h** | Publishes the user-facing API |
-| **user/usys.pl** | Generates the user-space syscall stubs |
-| **user/shmem_test.c** | Functional shared-memory test |
-| **user/log_test.c** | Multi-process concurrent-log test |
-| **Makefile** | Builds the two user test programs into the xv6 image |
-
-All xv6 source files are located under:
-
-~~~text
-assighnment 3/assighnment 3/xv6-riscv-riscv/
-~~~
-
-The directory spelling above matches the repository exactly.
+- Check zero size, address overflow, process bounds, user permissions, and all
+  source/destination page-table paths before changing a mapping.
+- Commit makes no allocations: replacing the validated leaf PTEs cannot fail
+  halfway through and never needs to unmap uninstalled pages during rollback.
+- Each alias retains a physical-frame reference before releasing its old
+  destination mapping. Owner exit/reaping therefore cannot free a live alias.
+- Unmap validates the entire shared range, releases its references, and flushes
+  local translations. Repeated unmap is rejected.
+- User ELF segments explicitly separate executable/read-only text from writable
+  data; the linker-script dependency is tracked during rebuilds.
+- Exit and fork tolerate unmapped holes. Fork copies remaining pages privately
+  and clears the shared marker on those new allocations.
+- A coarse VM spinlock serializes published page-table changes in map/unmap,
+  grow, fork, exec publication, and process reaping. Source process lock precedes
+  VM lock; mapping no longer takes two process locks in arbitrary order.
+- After unmap, `sz` remains the address-space upper bound. Accessing a hole faults
+  until an explicit mapping fills it. No demand paging or copy-on-write is added.
 
 ## Tests
 
-### shmem_test
+```bash
+sudo apt-get install gcc-riscv64-linux-gnu qemu-system-misc
+python3 scripts/test_qemu.py --cpus 1 --usertests
+python3 scripts/test_qemu.py --cpus 3
+```
 
-The shared-memory test exercises the core contract:
+The runner builds a clean image, boots the real kernel under QEMU system
+emulation, checks serial output, and fails on a panic, failed assertion, early
+exit, or timeout. The tests cover bidirectional visibility, invalid/overflowing
+ranges, preservation after rejected mapping, caller-only destinations, repeated
+alias replacement, double unmap, fork/exit with holes, private fork semantics,
+and a borrower that continues using a frame after its owner is reaped. The
+four-process CAS log asserts all four bounded records are present.
 
-1. A parent allocates and initializes a page.
-2. A child maps the parent's page.
-3. The child reads the parent's data and writes a new value.
-4. The parent observes the child's write through its original mapping.
-5. The child unmaps the shared page and continues allocating memory.
-6. Another child maps the page again to verify reuse.
+GitHub Actions runs the 1/3-vCPU matrix and the baseline `usertests -q` suite.
 
-This checks visibility in both directions, explicit unmapping, and repeat mapping across processes.
+## Scope
 
-### log_test
-
-The concurrent-log test creates four child processes and maps one parent-owned page into all of them. Each child:
-
-- searches the page for a free log slot;
-- reserves a 32-bit record header with an atomic compare-and-swap;
-- stores its child index and message length in the header;
-- writes an aligned record into the shared page.
-
-After all children exit, the parent reads the records from its own mapping. This test combines shared-memory visibility with a small lock-free reservation protocol.
-
-## Build and Run
-
-### Requirements
-
-You need a standard xv6-riscv development environment:
-
-- a RISC-V cross compiler and binutils;
-- QEMU with RISC-V system emulation;
-- GNU Make;
-- a Unix-like host.
-
-### Start xv6
-
-~~~console
-$ cd "assighnment 3/assighnment 3/xv6-riscv-riscv"
-$ make clean
-$ make qemu
-~~~
-
-At the xv6 shell, run:
-
-~~~console
-$ shmem_test
-$ log_test
-~~~
-
-To exit QEMU, press **Ctrl-a**, then **x**.
-
-## Implementation Details
-
-### Shared-Page Ownership
-
-Standard xv6 unmapping may release the physical page. That behavior is unsafe for an alias owned by another process. The modified **uvmunmap** checks **PTE_S** and removes a shared destination mapping without calling **kfree** for that frame.
-
-### Address and Flag Preservation
-
-**map_shared_pages**:
-
-- rounds the start address down and the end address up to page boundaries;
-- walks the source page table to obtain each physical frame;
-- preserves the source PTE permissions;
-- adds the **PTE_S** marker;
-- maps the pages at the corresponding destination virtual addresses;
-- returns the original unrounded source address so the caller retains its byte offset.
-
-### Failure Handling
-
-The implementation rejects missing processes, invalid or unmapped source pages, zero-sized requests, and invalid unmap ranges. If a multi-page mapping fails partway through, pages already installed by that call are removed.
-
-## What This Project Demonstrates
-
-- xv6 kernel development;
-- RISC-V Sv39 page-table manipulation;
-- system-call design from kernel handler to user stub;
-- virtual-to-physical mapping and PTE flags;
-- memory ownership and page lifecycle reasoning;
-- process-table synchronization;
-- atomic compare-and-swap in a shared-memory workload;
-- kernel/user integration testing.
-
-## Limitations
-
-This is a focused educational extension, not a general-purpose shared-memory subsystem. Mappings use the same virtual address in both processes, and the source process remains the owner of the underlying allocation. Applications must coordinate access to shared data and respect the mapped range's lifetime.
+This demonstrates page-table manipulation, system-call integration, memory
+ownership, process lifecycle, lock ordering, and atomic operations. The VM lock
+is intentionally coarse; it favors a small auditable educational implementation
+over production scalability. This project does not add a network driver.

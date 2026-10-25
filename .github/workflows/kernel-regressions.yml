@@ -1,0 +1,24 @@
+name: RISC-V kernel regressions
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  qemu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        cpus: [1, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install RISC-V compiler and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-linux-gnu qemu-system-misc
+      - name: Kernel shared-memory and baseline regressions
+        run: |
+          if [ '${{ matrix.cpus }}' = '1' ]; then
+            python3 scripts/test_qemu.py --cpus 1 --usertests
+          else
+            python3 scripts/test_qemu.py --cpus 3
+          fi

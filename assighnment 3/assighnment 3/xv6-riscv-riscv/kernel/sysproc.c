@@ -14,68 +14,39 @@ sys_map_shared_pages(void)
 {
   int src_pid, dst_pid;
   uint64 src_va, size;
-  struct proc *src_proc, *dst_proc;
-  
-  // Get arguments from user space
   argint(0, &src_pid);
   argint(1, &dst_pid);
-  argaddr(2, &src_va); 
+  argaddr(2, &src_va);
   argaddr(3, &size);
-   
-  
-  // Find source process
-  src_proc = 0;
-  for(struct proc *p = proc; p < &proc[NPROC]; p++){
-    acquire(&p->lock);
-    if(p->state != UNUSED && p->pid == src_pid){
-      src_proc = p;
-      break;
-    }
-    release(&p->lock);
-  }
-  
-  if(src_proc == 0)
+  struct proc *dst = myproc();
+  // A process may replace only its own mappings. No two-proc lock cycle.
+  if(dst_pid != dst->pid || src_pid == dst_pid)
     return -1;
-  
-  // Find destination process
-  dst_proc = 0;
-  for(struct proc *p = proc; p < &proc[NPROC]; p++){
-    if(p != src_proc) acquire(&p->lock);
-    if(p->state != UNUSED && p->pid == dst_pid){
-      dst_proc = p;
-      break;
+  for(struct proc *src = proc; src < &proc[NPROC]; src++){
+    acquire(&src->lock);
+    if(src->pid == src_pid &&
+       (src->state == RUNNING || src->state == RUNNABLE || src->state == SLEEPING)){
+      vmspace_acquire();
+      uint64 result = map_shared_pages(src, dst, src_va, size);
+      vmspace_release();
+      release(&src->lock);
+      return result;
     }
-    if(p != src_proc) release(&p->lock);
+    release(&src->lock);
   }
-  
-  if(dst_proc == 0){
-    release(&src_proc->lock);
-    return -1;
-  }
-  
-  // Call kernel function
-  uint64 result = map_shared_pages(src_proc, dst_proc, src_va, size);
-  
-  // Release locks
-  release(&src_proc->lock);
-  if(dst_proc != src_proc)
-    release(&dst_proc->lock);
-  
-  return result;
+  return -1;
 }
 
 uint64
 sys_unmap_shared_pages(void)
 {
   uint64 addr, size;
-  
-  // Get arguments from user space
-  argaddr(0, &addr);  
+  argaddr(0, &addr);
   argaddr(1, &size);
-    
-  
-  // Call kernel function for current process
-  return unmap_shared_pages(myproc(), addr, size);
+  vmspace_acquire();
+  uint64 result = unmap_shared_pages(myproc(), addr, size);
+  vmspace_release();
+  return result;
 }
 
 uint64
@@ -161,6 +132,7 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
 
 
 
